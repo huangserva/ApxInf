@@ -1,0 +1,243 @@
+//! X-VLA port operators: image normalization, convolution im2col, depthwise
+//! convolution, exact (erf) GELU and sigmoid.
+//!
+//! These are the operators the X-VLA DaViT tower needs that the model-neutral
+//! kernel set does not already provide. Layouts follow the model's token-major
+//! convention: activations are `[tokens, channels]` with `tokens = height *
+//! width` row-major.
+
+use apxinf_core::{DType, Error, Result, Shape, Tensor};
+
+use super::contracts::{bf16_output, check_cuda, gpu_ptr, optional_ptr, require_buffers};
+use crate::buffer::CudaBuffer;
+use crate::context::CudaContext;
+use crate::ffi;
+
+/// CLIPImageProcessor normalization for the X-VLA vision tower.
+pub const XVLA_IMAGE_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+pub const XVLA_IMAGE_STD: [f32; 3] = [0.229, 0.224, 0.225];
+
+/// Upload packed host bytes (e.g. RGB u8) as a device buffer.
+pub fn upload_bytes(ctx: &CudaContext, bytes: &[u8]) -> Result<CudaBuffer> {
+    if bytes.is_empty() {
+        return Err(Error::Other(
+            "X-VLA upload requires a non-empty buffer".into(),
+        ));
+    }
+    let buffer = CudaBuffer::alloc(bytes.len(), ctx.device_id()).map_err(Error::Cuda)?;
+    buffer.copy_from_host(bytes).map_err(Error::Cuda)?;
+    Ok(buffer)
+}
+
+/// `rgb` holds `height * width * 3` HWC u8 bytes; output is BF16 `[H*W, 3]`
+/// token-major with `(pixel/255 - mean) / std` applied per channel.
+pub fn rgb_u8_to_normalized_tokens_bf16(
+    ctx: &CudaContext,
+    rgb: &CudaBuffer,
+    height: usize,
+    width: usize,
+    mean: [f32; 3],
+    std: [f32; 3],
+) -> Result<Tensor> {
+    if height == 0 || width == 0 {
+        return Err(Error::Other(
+            "X-VLA image normalization needs a non-zero size".into(),
+        ));
+    }
+    let pixels = height
+        .checked_mul(width)
+        .ok_or_else(|| Error::Other("X-VLA image size overflow".into()))?;
+    require_buffers(
+        ctx,
+        "X-VLA image normalization",
+        &[("rgb", rgb, pixels.checked_mul(3).unwrap_or(usize::MAX))],
+    )?;
+    if std.iter().any(|value| *value == 0.0) {
+        return Err(Error::Other(
+            "X-VLA image normalization std must be non-zero".into(),
+        ));
+    }
+    let output = bf16_output(ctx, pixels, 3)?;
+    unsafe {
+        check_cuda(ffi::apxinf_xvla_rgb_u8_to_normalized_tokens_bf16(
+            rgb.ptr(),
+            output.ptr(),
+            height as i32,
+            width as i32,
+            mean.as_ptr(),
+            std.as_ptr(),
+            ctx.stream().handle(),
+        ))
+    }?;
+    Ok(output.into_tensor(Shape::new(vec![pixels, 3]), DType::BF16))
+}
+
+/// im2col for a dense convolution over a token-major `[H*W, C]` input.
+///
+/// Output is `[out_h * out_w, C * kh * kw]` with column index
+/// `((c*kh + ky)*kw + kx)`; out-of-bounds taps read as zero.
+#[allow(clippy::too_many_arguments)]
+pub fn im2col_bf16(
+    ctx: &CudaContext,
+    input: &Tensor,
+    height: usize,
+    width: usize,
+    kh: usize,
+    kw: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+) -> Result<Tensor> {
+    let dims = input.shape().dims();
+    if dims.len() != 2 || dims[0] != height * width {
+        return Err(Error::Other(format!(
+            "X-VLA im2col expects a token-major [{}, C] input, got {:?}",
+            height * width,
+            dims
+        )));
+    }
+    if input.dtype() != DType::BF16 {
+        return Err(Error::Other(format!(
+            "X-VLA im2col expects BF16 input, got {}",
+            input.dtype()
+        )));
+    }
+    if kh == 0 || kw == 0 || stride_h == 0 || stride_w == 0 || height == 0 || width == 0 {
+        return Err(Error::Other(
+            "X-VLA im2col received a zero-sized parameter".into(),
+        ));
+    }
+    if height + 2 * pad_h < kh || width + 2 * pad_w < kw {
+        return Err(Error::Other(
+            "X-VLA im2col kernel exceeds the padded input".into(),
+        ));
+    }
+    let channels = dims[1];
+    let out_h = (height + 2 * pad_h - kh) / stride_h + 1;
+    let out_w = (width + 2 * pad_w - kw) / stride_w + 1;
+    let rows = out_h * out_w;
+    let cols = channels * kh * kw;
+    let output = bf16_output(ctx, rows, cols)?;
+    unsafe {
+        check_cuda(ffi::apxinf_xvla_im2col_bf16(
+            gpu_ptr(input)?,
+            output.ptr(),
+            channels as i32,
+            height as i32,
+            width as i32,
+            kh as i32,
+            kw as i32,
+            stride_h as i32,
+            stride_w as i32,
+            pad_h as i32,
+            pad_w as i32,
+            ctx.stream().handle(),
+        ))
+    }?;
+    Ok(output.into_tensor(Shape::new(vec![rows, cols]), DType::BF16))
+}
+
+/// Depthwise 3×3, stride 1, pad 1 over a token-major `[H*W, C]` tensor.
+///
+/// `weight` is BF16 `[C, 9]` (`ky * 3 + kx` tap order), `bias` optional `[C]`.
+#[allow(clippy::too_many_arguments)]
+pub fn dwconv3x3_bf16(
+    ctx: &CudaContext,
+    input: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    height: usize,
+    width: usize,
+) -> Result<Tensor> {
+    let dims = input.shape().dims();
+    if dims.len() != 2 || dims[0] != height * width || height == 0 || width == 0 {
+        return Err(Error::Other(format!(
+            "X-VLA depthwise conv expects a token-major [{}, C] input, got {:?}",
+            height * width,
+            dims
+        )));
+    }
+    let channels = dims[1];
+    if input.dtype() != DType::BF16
+        || weight.dtype() != DType::BF16
+        || weight.shape().dims() != [channels, 9]
+    {
+        return Err(Error::Other(format!(
+            "X-VLA depthwise conv expects BF16 input and a [{channels}, 9] weight, got {} {:?}",
+            weight.dtype(),
+            weight.shape().dims()
+        )));
+    }
+    if let Some(bias) = bias {
+        if bias.dtype() != DType::BF16 || bias.shape().dims() != [channels] {
+            return Err(Error::Other(format!(
+                "X-VLA depthwise conv bias must be BF16 [{channels}]"
+            )));
+        }
+    }
+    let output = bf16_output(ctx, dims[0], channels)?;
+    unsafe {
+        check_cuda(ffi::apxinf_xvla_dwconv3x3_bf16(
+            gpu_ptr(input)?,
+            gpu_ptr(weight)?,
+            optional_ptr(bias)?,
+            output.ptr(),
+            channels as i32,
+            height as i32,
+            width as i32,
+            ctx.stream().handle(),
+        ))
+    }?;
+    Ok(output.into_tensor(input.shape().clone(), DType::BF16))
+}
+
+/// Exact (erf) GELU, shape-preserving, BF16 in/out with FP32 math inside.
+pub fn gelu_erf_bf16(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
+    elementwise_activation(ctx, input, ffi::apxinf_xvla_gelu_erf_bf16, "erf GELU")
+}
+
+/// Sigmoid, shape-preserving, BF16 in/out with FP32 math inside.
+pub fn sigmoid_bf16(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
+    elementwise_activation(ctx, input, ffi::apxinf_xvla_sigmoid_bf16, "sigmoid")
+}
+
+fn elementwise_activation(
+    ctx: &CudaContext,
+    input: &Tensor,
+    launch: unsafe extern "C" fn(
+        *const std::ffi::c_void,
+        *mut std::ffi::c_void,
+        i64,
+        ffi::cudaStream_t,
+    ) -> ffi::cudaError_t,
+    operation: &str,
+) -> Result<Tensor> {
+    if input.dtype() != DType::BF16 {
+        return Err(Error::Other(format!(
+            "X-VLA {operation} expects BF16 input, got {}",
+            input.dtype()
+        )));
+    }
+    let count: usize = input.shape().dims().iter().product();
+    if count == 0 {
+        return Err(Error::Other(format!(
+            "X-VLA {operation} received an empty tensor"
+        )));
+    }
+    let output = crate::workspace::output_buffer(
+        ctx,
+        count
+            .checked_mul(DType::BF16.size_in_bytes())
+            .ok_or_else(|| Error::Other(format!("X-VLA {operation} byte size overflow")))?,
+    )?;
+    unsafe {
+        check_cuda(launch(
+            gpu_ptr(input)?,
+            output.ptr(),
+            count as i64,
+            ctx.stream().handle(),
+        ))
+    }?;
+    Ok(output.into_tensor(input.shape().clone(), DType::BF16))
+}
