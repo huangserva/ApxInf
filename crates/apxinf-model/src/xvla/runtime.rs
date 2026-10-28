@@ -1,18 +1,20 @@
-//! X-VLA runtime: observation binding, RGB preprocessing, and eager execution.
+//! X-VLA runtime: observation binding, RGB preprocessing, and execution plans.
 //!
 //! The runtime is the VLA-family seam: it turns one [`VlaRequest`] into the
 //! three-stage forward pass (DaViT view tower, Florence-2 merged encoder, linear
 //! flow action head). RGB frames are normalized and patchified on device by the
 //! X-VLA kernels, so no host-side pixel preprocessing happens here.
 //!
-//! Preparation is eager in this step. CUDA graph capture of the three stages is
-//! a separate execution-policy step; `PreferGraph` therefore reports an explicit
-//! fallback instead of silently claiming a graph.
+//! Preparation can capture the three stages into CUDA graphs. Vision, language
+//! and the ten-step action loop each own a graph whose inputs and results live
+//! in fixed buffers; a plan captures once per `(views, domain)` pair and then
+//! refreshes those buffers before every replay.
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
-use apxinf_core::{Backend, DType, Device, Error, Result, SamplingBackend, Shape, Tensor};
+use apxinf_core::{Backend, DType, Device, Error, Graph, Result, SamplingBackend, Shape, Tensor};
 use half::bf16;
 
 use crate::accelerator::cuda::RuntimeBackend;
@@ -23,12 +25,16 @@ use crate::vla::{
 };
 
 use super::backend::kernels::xvla_ops;
-use super::backend::{transfers, Context, DeviceBuffer};
+use super::backend::{kernels, transfers, Context, DeviceBuffer};
 use super::config::XvlaConfig;
 use super::model::action::generate_actions;
-use super::model::text::encode_vlm;
+use super::model::text::{encode_vlm, encode_vlm_with_plan};
 use super::model::vision::encode_image;
 use super::weights::{ActionHeadWeights, VlmWeights};
+
+/// First graph arena size; doubled when a warmup traversal exhausts it.
+const INITIAL_WORKSPACE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_WORKSPACE_BYTES: usize = 2560 * 1024 * 1024;
 
 pub(crate) fn register_builtin() {
     crate::registry::register("xvla-cuda", load_registered);
@@ -62,6 +68,7 @@ fn load_runtime(path: &Path, backend: Arc<dyn Backend>) -> Result<XvlaRuntime> {
         config,
         vlm,
         head,
+        prepared: RefCell::new(None),
     })
 }
 
@@ -71,6 +78,25 @@ pub(crate) struct XvlaRuntime {
     config: Arc<XvlaConfig>,
     vlm: Arc<VlmWeights>,
     head: Arc<ActionHeadWeights>,
+    prepared: RefCell<Option<(InferenceSpec, XvlaPreparedInference)>>,
+}
+
+impl XvlaRuntime {
+    fn build_prepared(
+        &self,
+        spec: InferenceSpec,
+        policy: ExecutionPolicy,
+    ) -> Result<XvlaPreparedInference> {
+        Ok(XvlaPreparedInference {
+            spec,
+            policy,
+            backend: Arc::clone(&self.backend),
+            config: Arc::clone(&self.config),
+            vlm: Arc::clone(&self.vlm),
+            head: Arc::clone(&self.head),
+            graphs: RefCell::new(XvlaGraphState::default()),
+        })
+    }
 }
 
 impl VlaRuntime for XvlaRuntime {
@@ -96,7 +122,20 @@ impl VlaRuntime for XvlaRuntime {
     }
 
     fn infer(&self, request: &VlaRequest<'_>) -> Result<Action> {
-        run_xvla(&self.backend, &self.config, &self.vlm, &self.head, request)
+        let spec = request.observation.inference_spec();
+        let needs_plan = {
+            let cache = self.prepared.borrow();
+            cache.as_ref().map_or(true, |(cached, _)| *cached != spec)
+        };
+        if needs_plan {
+            let prepared = self.build_prepared(spec, ExecutionPolicy::PreferGraph)?;
+            drop(self.prepared.borrow_mut().replace((spec, prepared)));
+        }
+        let cache = self.prepared.borrow();
+        let (_, prepared) = cache
+            .as_ref()
+            .ok_or_else(|| Error::Other("X-VLA prepared plan was not installed".into()))?;
+        prepared.run(request)
     }
 
     fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>> {
@@ -109,29 +148,34 @@ impl VlaRuntime for XvlaRuntime {
         policy: ExecutionPolicy,
     ) -> Result<Box<dyn PreparedInference>> {
         spec.validate()?;
-        let fallback_reason = match policy {
-            ExecutionPolicy::Eager => None,
-            ExecutionPolicy::PreferGraph => {
-                Some("X-VLA CUDA graph capture is not implemented yet; running eager".into())
-            }
-            ExecutionPolicy::RequireGraph => {
-                return Err(Error::Other(
-                    "X-VLA CUDA graph capture is not implemented yet".into(),
-                ))
-            }
-        };
-        Ok(Box::new(XvlaPreparedInference {
-            spec: *spec,
-            backend: self.backend.clone(),
-            config: self.config.clone(),
-            vlm: self.vlm.clone(),
-            head: self.head.clone(),
-            fallback_reason,
-        }))
+        Ok(Box::new(self.build_prepared(*spec, policy)?))
     }
 
     fn execution_mode(&self) -> &'static str {
-        "eager"
+        match self
+            .prepared
+            .borrow()
+            .as_ref()
+            .map(|(_, prepared)| prepared.status())
+        {
+            None => "unprepared",
+            Some(PreparationStatus::Ready {
+                mode: ExecutionMode::Graph,
+                ..
+            }) => "graph",
+            Some(PreparationStatus::Ready {
+                mode: ExecutionMode::Eager,
+                ..
+            }) => "eager",
+            Some(PreparationStatus::Invalidated) => "invalidated",
+            Some(PreparationStatus::RuntimeManaged) => "runtime-managed",
+        }
+    }
+
+    fn clear_prepared(&self) -> Result<()> {
+        self.backend.synchronize()?;
+        drop(self.prepared.borrow_mut().take());
+        Ok(())
     }
 
     fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>> {
@@ -140,15 +184,21 @@ impl VlaRuntime for XvlaRuntime {
     }
 }
 
-/// Eager fixed-spec plan. Owns the shared runtime resources so it can outlive
-/// the runtime handle that produced it.
+#[derive(Default)]
+struct XvlaGraphState {
+    plan: Option<XvlaGraphs>,
+    fallback: Option<String>,
+}
+
+/// Fixed-shape plan that captures the three stages once per `(views, domain)`.
 struct XvlaPreparedInference {
     spec: InferenceSpec,
+    policy: ExecutionPolicy,
     backend: Arc<RuntimeBackend>,
     config: Arc<XvlaConfig>,
     vlm: Arc<VlmWeights>,
     head: Arc<ActionHeadWeights>,
-    fallback_reason: Option<String>,
+    graphs: RefCell<XvlaGraphState>,
 }
 
 impl PreparedInference for XvlaPreparedInference {
@@ -157,9 +207,20 @@ impl PreparedInference for XvlaPreparedInference {
     }
 
     fn status(&self) -> PreparationStatus {
-        PreparationStatus::Ready {
-            mode: ExecutionMode::Eager,
-            fallback_reason: self.fallback_reason.clone(),
+        let state = self.graphs.borrow();
+        match (&state.plan, &state.fallback) {
+            (Some(_), _) => PreparationStatus::Ready {
+                mode: ExecutionMode::Graph,
+                fallback_reason: None,
+            },
+            (None, Some(reason)) => PreparationStatus::Ready {
+                mode: ExecutionMode::Eager,
+                fallback_reason: Some(reason.clone()),
+            },
+            (None, None) => PreparationStatus::Ready {
+                mode: ExecutionMode::Eager,
+                fallback_reason: None,
+            },
         }
     }
 
@@ -171,20 +232,60 @@ impl PreparedInference for XvlaPreparedInference {
                 request.observation.inference_spec()
             )));
         }
-        run_xvla(&self.backend, &self.config, &self.vlm, &self.head, request)
+        if self.policy == ExecutionPolicy::Eager {
+            return run_xvla(&self.backend, &self.config, &self.vlm, &self.head, request);
+        }
+
+        let parts = request_parts(&self.config, request)?;
+        let mut state = self.graphs.borrow_mut();
+        if state.fallback.is_some() {
+            return run_xvla(&self.backend, &self.config, &self.vlm, &self.head, request);
+        }
+        let reusable = state
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.views == parts.views && plan.domain == parts.domain);
+        if !reusable {
+            // Release the previous arena before reserving the replacement.
+            state.plan = None;
+            match XvlaGraphs::capture(&self.backend, &self.config, &self.vlm, &self.head, &parts) {
+                Ok(plan) => state.plan = Some(plan),
+                Err(error) => {
+                    if self.policy == ExecutionPolicy::RequireGraph {
+                        return Err(error);
+                    }
+                    eprintln!("[apxinf] X-VLA graph capture unavailable, using eager: {error}");
+                    state.fallback = Some(error.to_string());
+                    return run_xvla(&self.backend, &self.config, &self.vlm, &self.head, request);
+                }
+            }
+        }
+        let plan = state
+            .plan
+            .as_ref()
+            .ok_or_else(|| Error::Other("X-VLA graph plan was not installed".into()))?;
+        plan.update(&self.backend, &parts)?;
+        plan.replay()?;
+        Ok(Action::new(plan.buffers.action.clone()))
     }
 }
 
-fn run_xvla(
-    backend: &RuntimeBackend,
+/// Validated request surfaces shared by eager and captured execution.
+struct RequestParts<'a, 'lat> {
+    bytes: &'a [u8],
+    token_ids: &'a [u32],
+    state: &'a Tensor,
+    views: usize,
+    domain: usize,
+    latent: InitialLatent<'lat>,
+}
+
+fn request_parts<'a, 'lat>(
     config: &XvlaConfig,
-    vlm: &VlmWeights,
-    head: &ActionHeadWeights,
-    request: &VlaRequest<'_>,
-) -> Result<Action> {
+    request: &'a VlaRequest<'lat>,
+) -> Result<RequestParts<'a, 'lat>> {
     let observation = request.observation;
     observation.validate()?;
-    let ctx = backend.context();
     let profile = &config.profile;
     let side = profile.image_size;
     if observation.token_ids.len() != profile.tokens {
@@ -228,12 +329,6 @@ fn run_xvla(
         .state
         .as_ref()
         .ok_or_else(|| Error::Other("X-VLA requires proprioception (Observation.state)".into()))?;
-    let proprio = upload_bf16(
-        ctx,
-        state,
-        &[config.action_space.dim_proprio],
-        "proprioception",
-    )?;
     let domain = request.metadata.embodiment_id.ok_or_else(|| {
         Error::Other("X-VLA requires a domain id (VlaMetadata.embodiment_id)".into())
     })?;
@@ -243,8 +338,36 @@ fn run_xvla(
             config.head.num_domains
         )));
     }
+    Ok(RequestParts {
+        bytes,
+        token_ids: &observation.token_ids,
+        state,
+        views,
+        domain,
+        latent: request.initial_latent,
+    })
+}
+
+fn run_xvla(
+    backend: &RuntimeBackend,
+    config: &XvlaConfig,
+    vlm: &VlmWeights,
+    head: &ActionHeadWeights,
+    request: &VlaRequest<'_>,
+) -> Result<Action> {
+    let parts = request_parts(config, request)?;
+    let ctx = backend.context();
+    let profile = &config.profile;
+    let side = profile.image_size;
+    let frame_bytes = side * side * 3;
+    let proprio = upload_bf16(
+        ctx,
+        parts.state,
+        &[config.action_space.dim_proprio],
+        "proprioception",
+    )?;
     let latent_shape = [profile.action_horizon, config.action_space.dim_action];
-    let latent = match request.initial_latent {
+    let latent = match parts.latent {
         InitialLatent::Provided(tensor) => {
             upload_bf16(ctx, tensor, &latent_shape, "initial latent")?
         }
@@ -262,8 +385,8 @@ fn run_xvla(
     };
 
     let mut features: Vec<Option<Tensor>> = Vec::with_capacity(profile.num_views);
-    for index in 0..views {
-        let frame = &bytes[index * frame_bytes..(index + 1) * frame_bytes];
+    for index in 0..parts.views {
+        let frame = &parts.bytes[index * frame_bytes..(index + 1) * frame_bytes];
         let raw = xvla_ops::upload_bytes(ctx, frame)?;
         let tokens = xvla_ops::rgb_u8_to_normalized_tokens_bf16(
             ctx,
@@ -284,13 +407,7 @@ fn run_xvla(
         features.push(None);
     }
     let refs: Vec<Option<&Tensor>> = features.iter().map(Option::as_ref).collect();
-    let output = encode_vlm(
-        ctx,
-        vlm,
-        &refs,
-        &observation.token_ids,
-        config.layer_norm_eps,
-    )?;
+    let output = encode_vlm(ctx, vlm, &refs, parts.token_ids, config.layer_norm_eps)?;
     let action = generate_actions(
         ctx,
         head,
@@ -298,14 +415,345 @@ fn run_xvla(
         &output.vlm_features,
         &output.aux_visual_inputs,
         &proprio,
-        domain,
+        parts.domain,
         &latent,
     )?;
     Ok(Action::new(action))
 }
 
-/// Convert one host float tensor of `dims` into device BF16 storage.
-fn upload_bf16(ctx: &Context, tensor: &Tensor, dims: &[usize], label: &str) -> Result<Tensor> {
+/// Fixed device buffers and one CUDA graph per pipeline stage.
+struct XvlaGraphs {
+    views: usize,
+    domain: usize,
+    buffers: StageBuffers,
+    workspace: kernels::GraphWorkspace,
+    vision: Box<dyn Graph>,
+    language: Box<dyn Graph>,
+    flow: Box<dyn Graph>,
+    // Keep every fixed weight and the config referenced by the captured work.
+    _fixed: (Arc<XvlaConfig>, Arc<VlmWeights>, Arc<ActionHeadWeights>),
+}
+
+struct StageBuffers {
+    raw_rgb: DeviceBuffer,
+    view_features: Vec<Tensor>,
+    vlm_features: Tensor,
+    aux_visual: Tensor,
+    state: Tensor,
+    noise: Tensor,
+    action: Tensor,
+    indices: xvla_ops::RowGatherPlan,
+}
+
+impl XvlaGraphs {
+    fn capture(
+        backend: &Arc<RuntimeBackend>,
+        config: &Arc<XvlaConfig>,
+        vlm: &Arc<VlmWeights>,
+        head: &Arc<ActionHeadWeights>,
+        parts: &RequestParts<'_, '_>,
+    ) -> Result<Self> {
+        let ctx = backend.context();
+        let profile = &config.profile;
+        let side = profile.image_size;
+        let frame_bytes = side * side * 3;
+        let hidden = config.head.hidden_size;
+        let image_tokens = config.vision.feature_sides(side)[3].pow(2) + 1;
+        let aux_rows = profile.tokens * (profile.num_views - 1);
+        let latent_shape = [profile.action_horizon, config.action_space.dim_action];
+
+        let raw_rgb =
+            DeviceBuffer::alloc_on(ctx, parts.views * frame_bytes).map_err(Error::Cuda)?;
+        raw_rgb.copy_from_host(parts.bytes).map_err(Error::Cuda)?;
+        let view_features = (0..profile.num_views)
+            .map(|_| static_tensor(ctx, &[image_tokens, hidden]))
+            .collect::<Result<Vec<_>>>()?;
+        let vlm_features = static_tensor(ctx, &[image_tokens + profile.tokens, hidden])?;
+        let aux_visual = static_tensor(ctx, &[aux_rows, hidden])?;
+        let state = static_tensor(ctx, &[config.action_space.dim_proprio])?;
+        let noise = static_tensor(ctx, &latent_shape)?;
+        let action = static_tensor(ctx, &latent_shape)?;
+
+        let state_host = host_bf16(
+            parts.state,
+            &[config.action_space.dim_proprio],
+            "proprioception",
+        )?;
+        transfers::copy_cpu_to_cuda(&state_host, &state)?;
+        match parts.latent {
+            InitialLatent::Provided(tensor) => {
+                let latent_host = host_bf16(tensor, &latent_shape, "initial latent")?;
+                transfers::copy_cpu_to_cuda(&latent_host, &noise)?;
+            }
+            InitialLatent::Generate { rng } => {
+                let mut generator = backend.create_normal_generator(noise.clone())?;
+                generator.generate(rng)?;
+            }
+        }
+        let indices = xvla_ops::prepare_row_gather(
+            ctx,
+            parts.token_ids,
+            vlm.text.embedding.shape().dims()[0],
+        )?;
+
+        let buffers = StageBuffers {
+            raw_rgb,
+            view_features,
+            vlm_features,
+            aux_visual,
+            state,
+            noise,
+            action,
+            indices,
+        };
+
+        let (workspace, vision, language, flow) = {
+            let body = StageBody {
+                ctx,
+                config: config.as_ref(),
+                vlm: vlm.as_ref(),
+                head: head.as_ref(),
+                views: parts.views,
+                domain: parts.domain,
+                buffers: &buffers,
+            };
+            let mut capacity = INITIAL_WORKSPACE_BYTES;
+            let (workspace, peak) = loop {
+                let workspace = kernels::GraphWorkspace::new(capacity, ctx.device_id())?;
+                match warmup(backend, &workspace, &body) {
+                    Ok(peak) => break (workspace, peak),
+                    Err(error)
+                        if is_workspace_exhaustion(&error) && capacity < MAX_WORKSPACE_BYTES =>
+                    {
+                        capacity = (capacity * 2).min(MAX_WORKSPACE_BYTES);
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            eprintln!(
+                "[apxinf] X-VLA warmup arena: capacity={} MiB peak={} MiB",
+                workspace.capacity() / (1024 * 1024),
+                peak / (1024 * 1024)
+            );
+            let (vision, _) = backend
+                .capture_graph(|| kernels::with_workspace(&workspace, || body.vision()))
+                .map_err(|error| Error::Other(format!("X-VLA vision graph capture: {error}")))?;
+            let (language, _) = backend
+                .capture_graph(|| kernels::with_workspace(&workspace, || body.language()))
+                .map_err(|error| Error::Other(format!("X-VLA language graph capture: {error}")))?;
+            let (flow, _) = backend
+                .capture_graph(|| kernels::with_workspace(&workspace, || body.action()))
+                .map_err(|error| Error::Other(format!("X-VLA action graph capture: {error}")))?;
+            (workspace, vision, language, flow)
+        };
+
+        let plan = Self {
+            views: parts.views,
+            domain: parts.domain,
+            buffers,
+            workspace,
+            vision,
+            language,
+            flow,
+            _fixed: (Arc::clone(config), Arc::clone(vlm), Arc::clone(head)),
+        };
+        plan.vision.replay()?;
+        plan.language.replay()?;
+        plan.flow.replay()?;
+        backend.synchronize()?;
+        eprintln!(
+            "[apxinf] X-VLA captured CUDA graphs: views={} domain={} arena={} MiB used={} MiB",
+            plan.views,
+            plan.domain,
+            plan.workspace.capacity() / (1024 * 1024),
+            plan.workspace.used() / (1024 * 1024)
+        );
+        Ok(plan)
+    }
+
+    fn update(&self, backend: &RuntimeBackend, parts: &RequestParts<'_, '_>) -> Result<()> {
+        backend.synchronize()?;
+        self.buffers
+            .raw_rgb
+            .copy_from_host(parts.bytes)
+            .map_err(Error::Cuda)?;
+
+        let state_dims = self.buffers.state.shape().dims().to_vec();
+        let state_host = host_bf16(parts.state, &state_dims, "proprioception")?;
+        transfers::copy_cpu_to_cuda(&state_host, &self.buffers.state)?;
+
+        let latent_dims = self.buffers.noise.shape().dims().to_vec();
+        match parts.latent {
+            InitialLatent::Provided(tensor) => {
+                let latent_host = host_bf16(tensor, &latent_dims, "initial latent")?;
+                transfers::copy_cpu_to_cuda(&latent_host, &self.buffers.noise)?;
+            }
+            InitialLatent::Generate { rng } => {
+                let mut generator = backend.create_normal_generator(self.buffers.noise.clone())?;
+                generator.generate(rng)?;
+            }
+        }
+        self.buffers.indices.update_rows(parts.token_ids)?;
+        Ok(())
+    }
+
+    fn replay(&self) -> Result<()> {
+        self.vision.replay()?;
+        self.language.replay()?;
+        self.flow.replay()?;
+        Ok(())
+    }
+}
+
+/// Borrowed view of the captured buffers and weights used inside a capture.
+struct StageBody<'a> {
+    ctx: &'a Context,
+    config: &'a XvlaConfig,
+    vlm: &'a VlmWeights,
+    head: &'a ActionHeadWeights,
+    views: usize,
+    domain: usize,
+    buffers: &'a StageBuffers,
+}
+
+impl StageBody<'_> {
+    fn vision(&self) -> Result<()> {
+        let side = self.config.profile.image_size;
+        let frame_bytes = side * side * 3;
+        for view in 0..self.views {
+            let raw = self
+                .buffers
+                .raw_rgb
+                .view(view * frame_bytes, frame_bytes)
+                .map_err(Error::Cuda)?;
+            let tokens = xvla_ops::rgb_u8_to_normalized_tokens_bf16(
+                self.ctx,
+                &raw,
+                side,
+                side,
+                xvla_ops::XVLA_IMAGE_MEAN,
+                xvla_ops::XVLA_IMAGE_STD,
+            )?;
+            let encoded = encode_image(
+                self.ctx,
+                &self.vlm.vision,
+                &tokens,
+                self.config.layer_norm_eps,
+            )?;
+            copy_into(&self.buffers.view_features[view], &encoded, self.ctx)?;
+        }
+        Ok(())
+    }
+
+    fn language(&self) -> Result<()> {
+        let refs: Vec<Option<&Tensor>> = (0..self.config.profile.num_views)
+            .map(|index| {
+                if index < self.views {
+                    Some(&self.buffers.view_features[index])
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let merged = encode_vlm_with_plan(
+            self.ctx,
+            self.vlm,
+            &refs,
+            &self.buffers.indices,
+            self.config.profile.tokens,
+            self.config.layer_norm_eps,
+        )?;
+        copy_into(&self.buffers.vlm_features, &merged.vlm_features, self.ctx)?;
+        copy_into(
+            &self.buffers.aux_visual,
+            &merged.aux_visual_inputs,
+            self.ctx,
+        )?;
+        Ok(())
+    }
+
+    fn action(&self) -> Result<()> {
+        let output = generate_actions(
+            self.ctx,
+            self.head,
+            self.config,
+            &self.buffers.vlm_features,
+            &self.buffers.aux_visual,
+            &self.buffers.state,
+            self.domain,
+            &self.buffers.noise,
+        )?;
+        copy_into(&self.buffers.action, &output, self.ctx)
+    }
+}
+
+fn warmup(
+    backend: &RuntimeBackend,
+    workspace: &kernels::GraphWorkspace,
+    body: &StageBody<'_>,
+) -> Result<usize> {
+    backend.synchronize()?;
+    let mut peak = 0;
+    for stage in 0..3 {
+        let mut stable = false;
+        for _ in 0..4 {
+            let generation = backend.context().tuning().generation();
+            kernels::prepare_with_workspace(workspace, || match stage {
+                0 => body.vision(),
+                1 => body.language(),
+                _ => body.action(),
+            })?;
+            backend.synchronize()?;
+            peak = peak.max(workspace.used());
+            if backend.context().tuning().generation() == generation {
+                stable = true;
+                break;
+            }
+        }
+        if !stable {
+            return Err(Error::Other(
+                "X-VLA GEMM tactics did not stabilize before graph capture".into(),
+            ));
+        }
+    }
+    Ok(peak)
+}
+
+fn is_workspace_exhaustion(error: &Error) -> bool {
+    error.to_string().contains("workspace exhausted")
+}
+
+fn static_tensor(ctx: &Context, dims: &[usize]) -> Result<Tensor> {
+    let elements: usize = dims.iter().product();
+    let bytes = elements
+        .checked_mul(DType::BF16.size_in_bytes())
+        .ok_or_else(|| Error::Other("X-VLA graph buffer size overflow".into()))?;
+    let buffer = DeviceBuffer::alloc_on(ctx, bytes).map_err(Error::Cuda)?;
+    buffer
+        .as_tensor(Shape::new(dims.to_vec()), DType::BF16)
+        .map_err(Error::Cuda)
+}
+
+fn copy_into(destination: &Tensor, source: &Tensor, ctx: &Context) -> Result<()> {
+    if destination.dtype() != source.dtype() || destination.shape().dims() != source.shape().dims()
+    {
+        return Err(Error::Other(format!(
+            "X-VLA graph stage copy mismatch: {} {:?} -> {} {:?}",
+            source.dtype(),
+            source.shape().dims(),
+            destination.dtype(),
+            destination.shape().dims()
+        )));
+    }
+    let source_buffer = DeviceBuffer::from_tensor(source).map_err(Error::Cuda)?;
+    let destination_buffer = DeviceBuffer::from_tensor(destination).map_err(Error::Cuda)?;
+    destination_buffer
+        .copy_from_device_async(&source_buffer, source.size_in_bytes(), ctx.stream())
+        .map_err(Error::Cuda)
+}
+
+/// Convert one host float tensor of `dims` into a CPU BF16 tensor.
+fn host_bf16(tensor: &Tensor, dims: &[usize], label: &str) -> Result<Tensor> {
     if tensor.device() != Device::Cpu {
         return Err(Error::Other(format!("X-VLA {label} must be a CPU tensor")));
     }
@@ -315,22 +763,25 @@ fn upload_bf16(ctx: &Context, tensor: &Tensor, dims: &[usize], label: &str) -> R
             tensor.shape().dims()
         )));
     }
-    let host = match tensor.dtype() {
-        DType::BF16 => tensor.clone(),
+    match tensor.dtype() {
+        DType::BF16 => Ok(tensor.clone()),
         DType::F32 | DType::F16 => {
             let rounded: Vec<bf16> = tensor
                 .to_f32_vec()?
                 .into_iter()
                 .map(bf16::from_f32)
                 .collect();
-            Tensor::from_bf16(dims.to_vec(), &rounded)?
+            Tensor::from_bf16(dims.to_vec(), &rounded)
         }
-        dtype => {
-            return Err(Error::Other(format!(
-                "X-VLA {label} must be f32, f16 or bf16, got {dtype}"
-            )))
-        }
-    };
+        dtype => Err(Error::Other(format!(
+            "X-VLA {label} must be f32, f16 or bf16, got {dtype}"
+        ))),
+    }
+}
+
+/// Upload one host float tensor of `dims` as device BF16 storage.
+fn upload_bf16(ctx: &Context, tensor: &Tensor, dims: &[usize], label: &str) -> Result<Tensor> {
+    let host = host_bf16(tensor, dims, label)?;
     transfers::to_cuda(&host, ctx.device_id())
 }
 

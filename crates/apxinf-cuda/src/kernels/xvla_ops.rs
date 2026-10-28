@@ -310,6 +310,29 @@ impl RowGatherPlan {
     pub fn input_rows(&self) -> usize {
         self.input_rows
     }
+
+    /// Replace the device index table for a new instruction.
+    ///
+    /// CUDA-graph plans keep the table address stable across replays, so the
+    /// token rows are refreshed here (outside capture) instead of allocating a
+    /// new table inside the graph.
+    pub fn update_rows(&self, rows: &[u32]) -> Result<()> {
+        if rows.len() != self.rows {
+            return Err(Error::Other(format!(
+                "X-VLA row gather expects {} indices, got {}",
+                self.rows,
+                rows.len()
+            )));
+        }
+        if let Some(row) = rows.iter().copied().find(|row| *row as usize >= self.input_rows) {
+            return Err(Error::Other(format!(
+                "X-VLA row index {row} is outside 0..{}",
+                self.input_rows
+            )));
+        }
+        let bytes: Vec<u8> = rows.iter().flat_map(|row| row.to_ne_bytes()).collect();
+        self.indices.copy_from_host(&bytes).map_err(Error::Cuda)
+    }
 }
 
 /// Prepare a device index table for [`gather_rows_bf16`].

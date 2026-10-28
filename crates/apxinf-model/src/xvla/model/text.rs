@@ -8,7 +8,8 @@
 use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
 use crate::xvla::backend::kernels;
-use crate::xvla::backend::{Context, DeviceBuffer};
+use crate::xvla::backend::kernels::xvla_ops;
+use crate::xvla::backend::Context;
 use crate::xvla::weights::{TextLayerWeights, VlmWeights};
 
 type Probe<'a> = &'a mut dyn FnMut(&str, &Tensor) -> Result<()>;
@@ -42,12 +43,63 @@ pub(crate) fn encode_vlm_probed(
     eps: f32,
     probe: Probe<'_>,
 ) -> Result<VlmOutput> {
+    let table_rows = weights.text.embedding.shape().dims()[0];
+    let plan = xvla_ops::prepare_row_gather(ctx, input_ids, table_rows)?;
+    encode_vlm_with_plan_probed(
+        ctx,
+        weights,
+        view_features,
+        &plan,
+        input_ids.len(),
+        eps,
+        probe,
+    )
+}
+
+/// Encoder pass over a pre-uploaded instruction row table.
+///
+/// CUDA-graph plans refresh [`xvla_ops::RowGatherPlan`] outside capture and
+/// replay the same device index buffer, so no host copy happens in a graph.
+pub(crate) fn encode_vlm_with_plan(
+    ctx: &Context,
+    weights: &VlmWeights,
+    view_features: &[Option<&Tensor>],
+    plan: &xvla_ops::RowGatherPlan,
+    token_count: usize,
+    eps: f32,
+) -> Result<VlmOutput> {
+    encode_vlm_with_plan_probed(
+        ctx,
+        weights,
+        view_features,
+        plan,
+        token_count,
+        eps,
+        &mut |_, _| Ok(()),
+    )
+}
+
+pub(crate) fn encode_vlm_with_plan_probed(
+    ctx: &Context,
+    weights: &VlmWeights,
+    view_features: &[Option<&Tensor>],
+    plan: &xvla_ops::RowGatherPlan,
+    token_count: usize,
+    eps: f32,
+    probe: Probe<'_>,
+) -> Result<VlmOutput> {
+    if token_count == 0 || plan.rows() != token_count {
+        return Err(Error::Other(format!(
+            "X-VLA text: instruction plan carries {} rows for {token_count} tokens",
+            plan.rows()
+        )));
+    }
     let text = &weights.text;
     let d_model = text.embedding.shape().dims()[1];
     let image_tokens = text.positions.shape().dims()[0]
-        .checked_sub(input_ids.len())
+        .checked_sub(token_count)
         .ok_or_else(|| Error::Other("X-VLA text: position table shorter than tokens".into()))?;
-    if input_ids.is_empty() || image_tokens == 0 {
+    if image_tokens == 0 {
         return Err(Error::Other(
             "X-VLA text: empty token or image sequence".into(),
         ));
@@ -71,10 +123,7 @@ pub(crate) fn encode_vlm_probed(
         }
     }
 
-    let rows: Vec<usize> = input_ids.iter().map(|&id| id as usize).collect();
-    let indices =
-        kernels::elementwise::prepare_row_indices(ctx, &rows, text.embedding.shape().dims()[0])?;
-    let embedded = kernels::elementwise::gather_rows_bf16_prepared(ctx, &text.embedding, &indices)?;
+    let embedded = xvla_ops::gather_rows_bf16(ctx, &text.embedding, plan)?;
     let merged = kernels::elementwise::concat_rows_bf16(ctx, primary, &embedded)?;
     let positioned = kernels::elementwise::add(ctx, &merged, &text.positions)?;
     let mut x = kernels::norm::layer_bf16(
@@ -173,10 +222,7 @@ fn zeros_bf16(ctx: &Context, rows: usize, cols: usize) -> Result<Tensor> {
         .checked_mul(cols)
         .and_then(|count| count.checked_mul(2))
         .ok_or_else(|| Error::Other("X-VLA text: zero block size overflow".into()))?;
-    let buffer = DeviceBuffer::alloc(bytes, ctx.device_id()).map_err(Error::Cuda)?;
-    buffer
-        .copy_from_host(&vec![0u8; bytes])
-        .map_err(Error::Cuda)?;
+    let buffer = kernels::scratch_buffer_zeroed(ctx, bytes)?;
     buffer
         .as_tensor(Shape::new(vec![rows, cols]), DType::BF16)
         .map_err(Error::Cuda)

@@ -173,7 +173,7 @@ fn channel_block(
     let row_bytes = channels * element;
     let span = (tokens - 1) * row_bytes + head_dim * element;
     let group_bytes = head_dim * element;
-    let output = DeviceBuffer::alloc(tokens * row_bytes, ctx.device_id()).map_err(Error::Cuda)?;
+    let output = kernels::scratch_buffer(ctx, tokens * row_bytes)?;
 
     for group in 0..groups {
         let offset = group * group_bytes;
@@ -181,8 +181,7 @@ fn channel_block(
         let k_view = k_buffer.view(offset, span).map_err(Error::Cuda)?;
         let v_view = v_buffer.view(offset, span).map_err(Error::Cuda)?;
 
-        let scores =
-            DeviceBuffer::alloc(head_dim * group_bytes, ctx.device_id()).map_err(Error::Cuda)?;
+        let scores = kernels::scratch_buffer(ctx, head_dim * group_bytes)?;
         kernels::gemm::write_ex(
             ctx,
             DType::BF16,

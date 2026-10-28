@@ -267,10 +267,7 @@ fn zeros_bf16(ctx: &Context, rows: usize, cols: usize) -> Result<Tensor> {
         .checked_mul(cols)
         .and_then(|count| count.checked_mul(2))
         .ok_or_else(|| Error::Other("X-VLA action head: zero block size overflow".into()))?;
-    let buffer = DeviceBuffer::alloc(bytes, ctx.device_id()).map_err(Error::Cuda)?;
-    buffer
-        .copy_from_host(&vec![0u8; bytes])
-        .map_err(Error::Cuda)?;
+    let buffer = kernels::scratch_buffer_zeroed(ctx, bytes)?;
     buffer
         .as_tensor(Shape::new(vec![rows, cols]), DType::BF16)
         .map_err(Error::Cuda)
