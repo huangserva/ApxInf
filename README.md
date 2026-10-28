@@ -330,6 +330,18 @@ Two views, 512x512 NHWC `uint8`, batch 1.
 | Jetson Xavier NX | FP16 | 312.38 ms | 3.2 Hz |
 | RTX 4090 | BF16 | 13.47 ms | 74.2 Hz |
 
+### X-VLA
+
+Two views, 224x224 NHWC `uint8`, batch 1, `X-VLA-Libero` checkpoint. Latency is
+steady-state CUDA-graph replay P50 over 30 samples after 10 warm-ups (3 runs);
+the cold first inference, including eager warm-up and graph capture, is 482 ms.
+The Python surface always selects `PreferGraph`. Reproduce with
+`scripts/bench_xvla.py`; parity method and limits in [doc/xvla.md](doc/xvla.md).
+
+| Hardware | Precision | Latency | Throughput |
+|---|---|---:|---:|
+| RTX 4090 | BF16 | 39.95 ms | 25.0 Hz |
+
 
 ## Port a new model with an agent
 
