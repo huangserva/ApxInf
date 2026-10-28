@@ -2,8 +2,8 @@
 
 use crate::context::CudaContext;
 use crate::kernels::xvla_ops::{
-    dwconv3x3_bf16, gelu_erf_bf16, im2col_bf16, rgb_u8_to_normalized_tokens_bf16, sigmoid_bf16,
-    upload_bytes, XVLA_IMAGE_MEAN, XVLA_IMAGE_STD,
+    dwconv3x3_bf16, gather_rows_bf16, gelu_erf_bf16, im2col_bf16, prepare_row_gather,
+    rgb_u8_to_normalized_tokens_bf16, sigmoid_bf16, upload_bytes, XVLA_IMAGE_MEAN, XVLA_IMAGE_STD,
 };
 use crate::test_util::{
     assert_bf16_close, assert_bf16_close_elementwise, download_bf16_as_fp32, upload_fp32_as_bf16,
@@ -174,4 +174,25 @@ fn dwconv3x3_matches_reference() {
         }
     }
     assert_bf16_close(&actual, &expected, 2e-3, 1e-2);
+}
+
+#[test]
+fn gather_rows_unbounded_matches_reference() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let rows = 5usize;
+    let cols = 3usize;
+    let values: Vec<f32> = (0..rows * cols).map(|index| index as f32 + 0.25).collect();
+    let input = upload_fp32_as_bf16(&ctx, &values, vec![rows, cols]).unwrap();
+    let indices: [u32; 9] = [2, 0, 4, 4, 1, 2, 0, 0, 3];
+    let plan = prepare_row_gather(&ctx, &indices, rows).unwrap();
+    let output = gather_rows_bf16(&ctx, &input, &plan).unwrap();
+    let actual = download_bf16_as_fp32(&output).unwrap();
+    let rounded = bf16_round(&values);
+    let mut expected = Vec::new();
+    for row in indices {
+        expected.extend_from_slice(&rounded[row as usize * cols..(row as usize + 1) * cols]);
+    }
+    assert_bf16_close_elementwise(&actual, &expected);
+
+    assert!(prepare_row_gather(&ctx, &[0, rows as u32], rows).is_err());
 }

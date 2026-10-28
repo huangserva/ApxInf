@@ -108,3 +108,18 @@ __global__ void xvla_sigmoid_bf16_kernel(
     const float x = __bfloat162float(input[gid]);
     output[gid] = __float2bfloat16(1.0f / (1.0f + expf(-x)));
 }
+
+// ── Unbounded row gather (window partition needs duplicated/zero rows) ────
+
+__global__ void xvla_gather_rows_bf16_kernel(
+    const __nv_bfloat16* input, const unsigned int* indices,
+    __nv_bfloat16* output, int64_t out_rows, int columns)
+{
+    int64_t count = out_rows * columns;
+    int64_t gid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= count) return;
+    const int64_t row = gid / columns;
+    const int column = (int)(gid % columns);
+    const unsigned int source = indices[row];
+    output[gid] = input[(int64_t)source * columns + column];
+}

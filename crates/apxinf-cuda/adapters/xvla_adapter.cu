@@ -97,3 +97,18 @@ extern "C" cudaError_t apxinf_xvla_sigmoid_bf16(
       static_cast<__nv_bfloat16*>(output), count);
   return cudaGetLastError();
 }
+
+extern "C" cudaError_t apxinf_xvla_gather_rows_bf16(
+    const void* input, const void* indices, void* output, int64_t out_rows,
+    int columns, cudaStream_t stream) {
+  if (input == nullptr || indices == nullptr || output == nullptr ||
+      out_rows <= 0 || columns <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t count = out_rows * columns;
+  xvla_gather_rows_bf16_kernel<<<blocks_for(count), kXvlaThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const unsigned int*>(indices),
+      static_cast<__nv_bfloat16*>(output), out_rows, columns);
+  return cudaGetLastError();
+}

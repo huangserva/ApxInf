@@ -1833,3 +1833,14 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 }
+
+extern "C" {
+    pub fn apxinf_xvla_gather_rows_bf16(
+        input: *const c_void,
+        indices: *const c_void,
+        output: *mut c_void,
+        out_rows: i64,
+        columns: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+}

@@ -12,3 +12,12 @@ pub mod config;
 pub mod math;
 
 pub use config::XvlaConfig;
+
+#[cfg(feature = "cuda")]
+pub(crate) mod load;
+
+#[cfg(feature = "cuda")]
+pub(crate) mod model;
+
+#[cfg(feature = "cuda")]
+pub(crate) mod weights;

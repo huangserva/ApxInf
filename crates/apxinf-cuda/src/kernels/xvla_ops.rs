@@ -1,5 +1,5 @@
 //! X-VLA port operators: image normalization, convolution im2col, depthwise
-//! convolution, exact (erf) GELU and sigmoid.
+//! convolution, exact (erf) GELU, sigmoid, and padded row gathers.
 //!
 //! These are the operators the X-VLA DaViT tower needs that the model-neutral
 //! kernel set does not already provide. Layouts follow the model's token-major
@@ -200,6 +200,87 @@ pub fn gelu_erf_bf16(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
 /// Sigmoid, shape-preserving, BF16 in/out with FP32 math inside.
 pub fn sigmoid_bf16(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     elementwise_activation(ctx, input, ffi::apxinf_xvla_sigmoid_bf16, "sigmoid")
+}
+
+/// Row gather with a caller-prepared index table.
+///
+/// Unlike the generic row gather this permits repeated rows and tables that
+/// are longer than the source matrix, which is exactly what padded window
+/// partition needs (padded slots index a trailing all-zero row).
+pub struct RowGatherPlan {
+    indices: CudaBuffer,
+    rows: usize,
+    input_rows: usize,
+}
+
+impl RowGatherPlan {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn input_rows(&self) -> usize {
+        self.input_rows
+    }
+}
+
+/// Prepare a device index table for [`gather_rows_bf16`].
+pub fn prepare_row_gather(
+    ctx: &CudaContext,
+    rows: &[u32],
+    input_rows: usize,
+) -> Result<RowGatherPlan> {
+    if rows.is_empty() || input_rows == 0 {
+        return Err(Error::Other(
+            "X-VLA row gather needs indices and a non-empty source".into(),
+        ));
+    }
+    if let Some(row) = rows.iter().copied().find(|row| *row as usize >= input_rows) {
+        return Err(Error::Other(format!(
+            "X-VLA row index {row} is outside 0..{input_rows}"
+        )));
+    }
+    let bytes: Vec<u8> = rows.iter().flat_map(|row| row.to_ne_bytes()).collect();
+    let buffer = CudaBuffer::alloc(bytes.len(), ctx.device_id()).map_err(Error::Cuda)?;
+    buffer.copy_from_host(&bytes).map_err(Error::Cuda)?;
+    Ok(RowGatherPlan {
+        indices: buffer,
+        rows: rows.len(),
+        input_rows,
+    })
+}
+
+/// Gather BF16 rows (`input` must have `plan.input_rows()` rows).
+pub fn gather_rows_bf16(ctx: &CudaContext, input: &Tensor, plan: &RowGatherPlan) -> Result<Tensor> {
+    let dims = input.shape().dims();
+    if dims.len() != 2 || dims[0] != plan.input_rows || input.dtype() != DType::BF16 {
+        return Err(Error::Other(format!(
+            "X-VLA row gather expects a BF16 [{}, C] source, got {} {:?}",
+            plan.input_rows,
+            input.dtype(),
+            dims
+        )));
+    }
+    require_buffers(
+        ctx,
+        "X-VLA row gather",
+        &[(
+            "indices",
+            &plan.indices,
+            plan.rows * std::mem::size_of::<u32>(),
+        )],
+    )?;
+    let output = bf16_output(ctx, plan.rows, dims[1])?;
+    unsafe {
+        check_cuda(ffi::apxinf_xvla_gather_rows_bf16(
+            gpu_ptr(input)?,
+            plan.indices.ptr(),
+            output.ptr(),
+            plan.rows as i64,
+            dims[1] as i32,
+            ctx.stream().handle(),
+        ))
+    }?;
+    Ok(output.into_tensor(Shape::new(vec![plan.rows, dims[1]]), DType::BF16))
 }
 
 fn elementwise_activation(

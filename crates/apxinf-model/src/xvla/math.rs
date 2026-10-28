@@ -62,7 +62,9 @@ pub fn timestep_embedding(t: f32, dim: usize, max_period: usize) -> Vec<f32> {
 
 /// The inference schedule: `i / steps` for `i = steps ..= 1` (1.0, 0.9, …, 0.1).
 pub fn flow_timesteps(steps: usize) -> Vec<f32> {
-    (0..steps).map(|index| (steps - index) as f32 / steps as f32).collect()
+    (0..steps)
+        .map(|index| (steps - index) as f32 / steps as f32)
+        .collect()
 }
 
 /// Window partition / reverse tables for one DaViT stage.
@@ -164,7 +166,10 @@ mod tests {
 
     #[test]
     fn flow_schedule_descends() {
-        assert_eq!(flow_timesteps(10), vec![1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]);
+        assert_eq!(
+            flow_timesteps(10),
+            vec![1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
+        );
     }
 
     #[test]
@@ -184,7 +189,10 @@ mod tests {
         assert_eq!(plan.windows(), 1);
         assert_eq!(plan.partition_rows.len(), 144);
         assert_eq!(plan.sentinel, 49);
-        assert_eq!(plan.partition_rows.iter().filter(|row| **row == 49).count(), 144 - 49);
+        assert_eq!(
+            plan.partition_rows.iter().filter(|row| **row == 49).count(),
+            144 - 49
+        );
         let plan = window_plan(14, 14, 12);
         assert_eq!((plan.windows_h, plan.windows_w, plan.windows()), (2, 2, 4));
         for (out, src) in plan.reverse_rows.iter().enumerate() {

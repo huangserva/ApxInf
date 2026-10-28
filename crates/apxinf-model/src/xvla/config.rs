@@ -192,9 +192,8 @@ impl XvlaConfig {
     /// Parse a checkpoint `config.json` and require the implemented profile.
     pub fn from_checkpoint(dir: &Path) -> Result<Self> {
         let path = dir.join("config.json");
-        let raw = std::fs::read_to_string(&path).map_err(|error| {
-            Error::Other(format!("failed to read {}: {error}", path.display()))
-        })?;
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|error| Error::Other(format!("failed to read {}: {error}", path.display())))?;
         let root: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|error| Error::Other(format!("invalid {}: {error}", path.display())))?;
         Self::from_json(&root)
@@ -220,9 +219,7 @@ impl XvlaConfig {
 
         let dims_vec = usize_array(vision, "dim_embed")?;
         let depths_vec = usize_array(vision, "depths")?;
-        if dims_vec.as_slice() != [256, 512, 1024, 2048]
-            || depths_vec.as_slice() != [1, 1, 9, 1]
-        {
+        if dims_vec.as_slice() != [256, 512, 1024, 2048] || depths_vec.as_slice() != [1, 1, 9, 1] {
             return Err(Error::Other(format!(
                 "xvla: vision dims/depths {dims_vec:?}/{depths_vec:?} not implemented"
             )));
@@ -338,7 +335,10 @@ impl XvlaConfig {
             problems.push(format!("action head {:?} not supported", self.head));
         }
         if self.profile != expected.profile {
-            problems.push(format!("profile {:?} is not the validated one", self.profile));
+            problems.push(format!(
+                "profile {:?} is not the validated one",
+                self.profile
+            ));
         }
         if problems.is_empty() {
             Ok(())
@@ -361,7 +361,11 @@ fn usize_at(value: &serde_json::Value, key: &str) -> Result<usize> {
     field(value, key)?
         .as_u64()
         .map(|number| number as usize)
-        .ok_or_else(|| Error::Other(format!("xvla config: `{key}` must be a non-negative integer")))
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "xvla config: `{key}` must be a non-negative integer"
+            ))
+        })
 }
 
 fn number_at(value: &serde_json::Value, key: &str) -> Result<f64> {
@@ -398,10 +402,9 @@ fn usize_array(value: &serde_json::Value, key: &str) -> Result<Vec<usize>> {
     array
         .iter()
         .map(|entry| {
-            entry
-                .as_u64()
-                .map(|number| number as usize)
-                .ok_or_else(|| Error::Other(format!("xvla config: `{key}` entries must be integers")))
+            entry.as_u64().map(|number| number as usize).ok_or_else(|| {
+                Error::Other(format!("xvla config: `{key}` entries must be integers"))
+            })
         })
         .collect()
 }
@@ -413,17 +416,20 @@ fn bool_array(value: &serde_json::Value, key: &str) -> Result<Vec<bool>> {
     array
         .iter()
         .map(|entry| {
-            entry
-                .as_bool()
-                .ok_or_else(|| Error::Other(format!("xvla config: `{key}` entries must be booleans")))
+            entry.as_bool().ok_or_else(|| {
+                Error::Other(format!("xvla config: `{key}` entries must be booleans"))
+            })
         })
         .collect()
 }
 
 fn fixed4<T: Copy>(values: &[T]) -> Result<[T; 4]> {
-    values
-        .try_into()
-        .map_err(|_| Error::Other(format!("xvla config: expected 4 entries, got {}", values.len())))
+    values.try_into().map_err(|_| {
+        Error::Other(format!(
+            "xvla config: expected 4 entries, got {}",
+            values.len()
+        ))
+    })
 }
 
 #[cfg(test)]
