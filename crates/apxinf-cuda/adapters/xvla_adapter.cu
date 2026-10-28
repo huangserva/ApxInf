@@ -98,6 +98,43 @@ extern "C" cudaError_t apxinf_xvla_sigmoid_bf16(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_xvla_pack_action_tokens_bf16(
+    const void* action, const void* proprio, const void* time, void* output,
+    int rows, int dim_action, int dim_time, int gripper0, int gripper1,
+    cudaStream_t stream) {
+  if (action == nullptr || proprio == nullptr || time == nullptr ||
+      output == nullptr || rows <= 0 || dim_action <= 0 || dim_time <= 0 ||
+      gripper0 < 0 || gripper1 < 0 || gripper0 >= dim_action ||
+      gripper1 >= dim_action) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t count = static_cast<int64_t>(rows) *
+                        (dim_action * 2 + dim_time);
+  xvla_pack_action_tokens_bf16_kernel<<<blocks_for(count), kXvlaThreads, 0,
+                                        stream>>>(
+      static_cast<const __nv_bfloat16*>(action),
+      static_cast<const __nv_bfloat16*>(proprio),
+      static_cast<const __nv_bfloat16*>(time),
+      static_cast<__nv_bfloat16*>(output), rows, dim_action, dim_time,
+      gripper0, gripper1);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_xvla_sigmoid_columns_bf16(
+    const void* input, void* output, int rows, int columns, int index0,
+    int index1, cudaStream_t stream) {
+  if (input == nullptr || output == nullptr || rows <= 0 || columns <= 0 ||
+      index0 < 0 || index1 < 0 || index0 >= columns || index1 >= columns) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t count = static_cast<int64_t>(rows) * columns;
+  xvla_sigmoid_columns_bf16_kernel<<<blocks_for(count), kXvlaThreads, 0,
+                                     stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<__nv_bfloat16*>(output), rows, columns, index0, index1);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_xvla_gather_rows_bf16(
     const void* input, const void* indices, void* output, int64_t out_rows,
     int columns, cudaStream_t stream) {

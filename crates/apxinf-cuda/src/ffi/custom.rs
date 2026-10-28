@@ -1835,6 +1835,27 @@ extern "C" {
 }
 
 extern "C" {
+    pub fn apxinf_xvla_pack_action_tokens_bf16(
+        action: *const c_void,
+        proprio: *const c_void,
+        time: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        dim_action: i32,
+        dim_time: i32,
+        gripper0: i32,
+        gripper1: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_xvla_sigmoid_columns_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        columns: i32,
+        index0: i32,
+        index1: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_xvla_gather_rows_bf16(
         input: *const c_void,
         indices: *const c_void,

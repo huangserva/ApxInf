@@ -5,9 +5,10 @@
 //! flattened in im2col tap order `[in_channels * kh * kw, out_channels]`, and
 //! depthwise weights are `[channels, 9]` with `ky * 3 + kx` tap order.
 
-use apxinf_core::Tensor;
+use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
 use crate::xvla::backend::kernels::xvla_ops::RowGatherPlan;
+use crate::xvla::backend::DeviceBuffer;
 
 #[derive(Debug)]
 pub struct LayerNormWeights {
@@ -116,4 +117,101 @@ pub struct TextWeights {
 pub struct VlmWeights {
     pub vision: VisionWeights,
     pub text: TextWeights,
+}
+
+/// Domain-sliced linear layer (`DomainAwareLinear`): one `[input, output]`
+/// matrix and one `[output]` bias per domain, stacked along the checkpoint
+/// embedding axis.
+#[derive(Debug)]
+pub struct DomainLinearWeights {
+    /// `[domains * input, output]` row-major; each checkpoint row is already
+    /// `[input, output]` flattened (`W.view(B, input, output)` in the reference).
+    pub weight: Tensor,
+    /// `[domains, output]`.
+    pub bias: Tensor,
+    pub domains: usize,
+    pub input: usize,
+    pub output: usize,
+}
+
+impl DomainLinearWeights {
+    /// Zero-copy `[input, output]` view for one domain.
+    pub fn weight_view(&self, domain: usize) -> Result<Tensor> {
+        if domain >= self.domains {
+            return Err(Error::Other(format!(
+                "X-VLA domain {domain} is out of range (domains = {})",
+                self.domains
+            )));
+        }
+        domain_view(
+            &self.weight,
+            domain,
+            self.input * self.output,
+            &[self.input, self.output],
+        )
+    }
+
+    /// Zero-copy `[output]` bias view for one domain.
+    pub fn bias_view(&self, domain: usize) -> Result<Tensor> {
+        if domain >= self.domains {
+            return Err(Error::Other(format!(
+                "X-VLA domain {domain} is out of range (domains = {})",
+                self.domains
+            )));
+        }
+        domain_view(&self.bias, domain, self.output, &[self.output])
+    }
+}
+
+fn domain_view(tensor: &Tensor, domain: usize, elements: usize, dims: &[usize]) -> Result<Tensor> {
+    let buffer = DeviceBuffer::from_tensor(tensor).map_err(Error::Cuda)?;
+    let element_bytes = DType::BF16.size_in_bytes();
+    let view = buffer
+        .view(domain * elements * element_bytes, elements * element_bytes)
+        .map_err(Error::Cuda)?;
+    view.as_tensor(Shape::new(dims.to_vec()), DType::BF16)
+        .map_err(Error::Cuda)
+}
+
+/// One pre-norm transformer block of the action head.
+#[derive(Debug)]
+pub struct ActionBlockWeights {
+    pub norm1: LayerNormWeights,
+    pub qkv: LinearWeights,
+    pub proj: LinearWeights,
+    pub norm2: LayerNormWeights,
+    pub fc1: LinearWeights,
+    pub fc2: LinearWeights,
+}
+
+/// SoftPromptedTransformer weights (24 pre-norm blocks + domain projections).
+#[derive(Debug)]
+pub struct ActionHeadWeights {
+    pub vlm_proj: LinearWeights,
+    pub aux_visual_proj: LinearWeights,
+    /// `[action_horizon + merged_tokens + aux_tokens, hidden]` prefix of the
+    /// checkpoint `pos_emb` table (soft prompts receive no positions).
+    pub pos_emb: Tensor,
+    pub norm: LayerNormWeights,
+    pub action_encoder: DomainLinearWeights,
+    pub action_decoder: DomainLinearWeights,
+    /// `[domains * len_soft_prompts, hidden]` flattened soft prompt table.
+    pub soft_prompt: Tensor,
+    pub blocks: Vec<ActionBlockWeights>,
+    /// Precomputed timestep embeddings `[flow_steps, dim_time]`, row `k` for
+    /// `t = (k + 1) / flow_steps`.
+    pub time_tokens: Tensor,
+}
+
+impl ActionHeadWeights {
+    /// Load the action head from an X-VLA checkpoint directory or file.
+    pub fn from_checkpoint(
+        config: &crate::xvla::config::XvlaConfig,
+        path: &std::path::Path,
+        ctx: &crate::xvla::backend::Context,
+    ) -> Result<Self> {
+        let (mut tensors, _) =
+            apxinf_loader::safetensors::load_native_path(path).map_err(Error::Other)?;
+        crate::xvla::load::load_action(&mut tensors, config, ctx)
+    }
 }

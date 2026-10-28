@@ -202,6 +202,95 @@ pub fn sigmoid_bf16(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     elementwise_activation(ctx, input, ffi::apxinf_xvla_sigmoid_bf16, "sigmoid")
 }
 
+/// Pack `[action | proprio | time]` rows for the flow head, zeroing the
+/// gripper columns of the action and proprio blocks (ee6d preprocess).
+pub fn pack_action_tokens_bf16(
+    ctx: &CudaContext,
+    action: &Tensor,
+    proprio: &Tensor,
+    time: &Tensor,
+    gripper: [usize; 2],
+) -> Result<Tensor> {
+    let action_dims = action.shape().dims();
+    let proprio_dims = proprio.shape().dims();
+    let time_dims = time.shape().dims();
+    if action_dims.len() != 2 || proprio_dims.len() != 1 || time_dims.len() != 1 {
+        return Err(Error::Other(format!(
+            "X-VLA action packing expects action [rows, dim], proprio [dim] and time [dim_time], got {:?} {:?} {:?}",
+            action_dims, proprio_dims, time_dims
+        )));
+    }
+    let (rows, dim_action) = (action_dims[0], action_dims[1]);
+    if proprio_dims[0] != dim_action
+        || time_dims[0] == 0
+        || rows == 0
+        || dim_action == 0
+        || gripper[0] >= dim_action
+        || gripper[1] >= dim_action
+    {
+        return Err(Error::Other(
+            "X-VLA action packing has incompatible dimensions".into(),
+        ));
+    }
+    if [action, proprio, time]
+        .into_iter()
+        .any(|tensor| tensor.dtype() != DType::BF16)
+    {
+        return Err(Error::Other(
+            "X-VLA action packing requires BF16 inputs".into(),
+        ));
+    }
+    let columns = dim_action * 2 + time_dims[0];
+    let output = bf16_output(ctx, rows, columns)?;
+    unsafe {
+        check_cuda(ffi::apxinf_xvla_pack_action_tokens_bf16(
+            gpu_ptr(action)?,
+            gpu_ptr(proprio)?,
+            gpu_ptr(time)?,
+            output.ptr(),
+            rows as i32,
+            dim_action as i32,
+            time_dims[0] as i32,
+            gripper[0] as i32,
+            gripper[1] as i32,
+            ctx.stream().handle(),
+        ))
+    }?;
+    Ok(output.into_tensor(Shape::new(vec![rows, columns]), DType::BF16))
+}
+
+/// Sigmoid applied to two columns, all other columns copied unchanged.
+pub fn sigmoid_columns_bf16(
+    ctx: &CudaContext,
+    input: &Tensor,
+    indices: [usize; 2],
+) -> Result<Tensor> {
+    let dims = input.shape().dims();
+    if dims.len() != 2 || dims[0] == 0 || dims[1] == 0 {
+        return Err(Error::Other(format!(
+            "X-VLA column sigmoid expects a non-empty matrix, got {dims:?}"
+        )));
+    }
+    if input.dtype() != DType::BF16 || indices[0] >= dims[1] || indices[1] >= dims[1] {
+        return Err(Error::Other(
+            "X-VLA column sigmoid requires BF16 and in-range indices".into(),
+        ));
+    }
+    let output = bf16_output(ctx, dims[0], dims[1])?;
+    unsafe {
+        check_cuda(ffi::apxinf_xvla_sigmoid_columns_bf16(
+            gpu_ptr(input)?,
+            output.ptr(),
+            dims[0] as i32,
+            dims[1] as i32,
+            indices[0] as i32,
+            indices[1] as i32,
+            ctx.stream().handle(),
+        ))
+    }?;
+    Ok(output.into_tensor(input.shape().clone(), DType::BF16))
+}
+
 /// Row gather with a caller-prepared index table.
 ///
 /// Unlike the generic row gather this permits repeated rows and tables that

@@ -16,8 +16,9 @@ use crate::xvla::backend::{transfers, Context};
 use crate::xvla::config::XvlaConfig;
 use crate::xvla::math::image_position_table;
 use crate::xvla::weights::{
-    DepthwiseWeights, LayerNormWeights, LinearWeights, StagePlan, TextLayerWeights, TextWeights,
-    VisionBlockWeights, VisionStageWeights, VisionWeights, VlmWeights,
+    ActionBlockWeights, ActionHeadWeights, DepthwiseWeights, DomainLinearWeights, LayerNormWeights,
+    LinearWeights, StagePlan, TextLayerWeights, TextWeights, VisionBlockWeights,
+    VisionStageWeights, VisionWeights, VlmWeights,
 };
 
 impl VisionWeights {
@@ -161,6 +162,172 @@ fn load_vision(
         spatial_mean_row: device_bf16(ctx, &[1, tokens], &vec![1.0; tokens])?,
         input_side: side,
     })
+}
+
+pub(crate) fn load_action(
+    tensors: &mut HashMap<String, Tensor>,
+    config: &XvlaConfig,
+    ctx: &Context,
+) -> Result<ActionHeadWeights> {
+    let head = &config.head;
+    let prefix = "transformer";
+    let hidden = head.hidden_size;
+    let dim_action = config.action_space.dim_action;
+    let dim_proprio = config.action_space.dim_proprio;
+    let dim_time = head.dim_time;
+
+    let vlm_proj = take_linear(ctx, tensors, &format!("{prefix}.vlm_proj"), hidden, hidden)?;
+    let aux_visual_proj = take_linear(
+        ctx,
+        tensors,
+        &format!("{prefix}.aux_visual_proj"),
+        hidden,
+        hidden,
+    )?;
+
+    let image_tokens = config.vision.feature_sides(config.profile.image_size)[3].pow(2) + 1;
+    let merged_tokens = image_tokens + config.profile.tokens;
+    let aux_tokens = config.profile.tokens * (config.profile.num_views - 1);
+    let position_tokens = config.profile.action_horizon + merged_tokens + aux_tokens;
+    let positions = take_f32(
+        tensors,
+        &format!("{prefix}.pos_emb"),
+        &[1, head.max_len_seq, hidden],
+    )?;
+    let pos_emb = device_bf16(
+        ctx,
+        &[position_tokens, hidden],
+        &positions[..position_tokens * hidden],
+    )?;
+
+    let norm = take_layer_norm(ctx, tensors, &format!("{prefix}.norm"), hidden)?;
+
+    let action_encoder = take_domain_linear(
+        ctx,
+        tensors,
+        &format!("{prefix}.action_encoder"),
+        head.num_domains,
+        dim_action + dim_proprio + dim_time,
+        hidden,
+    )?;
+    let action_decoder = take_domain_linear(
+        ctx,
+        tensors,
+        &format!("{prefix}.action_decoder"),
+        head.num_domains,
+        hidden,
+        dim_action,
+    )?;
+
+    let soft_prompt = device_bf16(
+        ctx,
+        &[head.num_domains * head.len_soft_prompts, hidden],
+        &take_f32(
+            tensors,
+            &format!("{prefix}.soft_prompt_hub.weight"),
+            &[head.num_domains, head.len_soft_prompts * hidden],
+        )?,
+    )?;
+
+    let mut blocks = Vec::with_capacity(head.depth);
+    for index in 0..head.depth {
+        let block = format!("{prefix}.blocks.{index}");
+        blocks.push(ActionBlockWeights {
+            norm1: take_layer_norm(ctx, tensors, &format!("{block}.norm1"), hidden)?,
+            qkv: take_linear(
+                ctx,
+                tensors,
+                &format!("{block}.attn.qkv"),
+                hidden,
+                hidden * 3,
+            )?,
+            proj: take_linear(ctx, tensors, &format!("{block}.attn.proj"), hidden, hidden)?,
+            norm2: take_layer_norm(ctx, tensors, &format!("{block}.norm2"), hidden)?,
+            fc1: take_linear(
+                ctx,
+                tensors,
+                &format!("{block}.mlp.fc1"),
+                hidden,
+                hidden * head.mlp_ratio,
+            )?,
+            fc2: take_linear(
+                ctx,
+                tensors,
+                &format!("{block}.mlp.fc2"),
+                hidden * head.mlp_ratio,
+                hidden,
+            )?,
+        });
+    }
+
+    let time_tokens = device_bf16(
+        ctx,
+        &[config.profile.num_flow_steps, dim_time],
+        &timestep_table(
+            config.profile.num_flow_steps,
+            dim_time,
+            head.time_max_period,
+        ),
+    )?;
+
+    Ok(ActionHeadWeights {
+        vlm_proj,
+        aux_visual_proj,
+        pos_emb,
+        norm,
+        action_encoder,
+        action_decoder,
+        soft_prompt,
+        blocks,
+        time_tokens,
+    })
+}
+
+/// `DomainAwareLinear`: each checkpoint embedding row is already `[input, output]`.
+fn take_domain_linear(
+    ctx: &Context,
+    tensors: &mut HashMap<String, Tensor>,
+    prefix: &str,
+    domains: usize,
+    input_dim: usize,
+    output_dim: usize,
+) -> Result<DomainLinearWeights> {
+    let weight = take_f32(
+        tensors,
+        &format!("{prefix}.fc.weight"),
+        &[domains, output_dim * input_dim],
+    )?;
+    Ok(DomainLinearWeights {
+        weight: device_bf16(ctx, &[domains * input_dim, output_dim], &weight)?,
+        bias: device_bf16(
+            ctx,
+            &[domains, output_dim],
+            &take_f32(
+                tensors,
+                &format!("{prefix}.bias.weight"),
+                &[domains, output_dim],
+            )?,
+        )?,
+        domains,
+        input: input_dim,
+        output: output_dim,
+    })
+}
+
+/// Sinusoidal timestep embeddings `[cos(half); sin(half)]` for `t = row / steps`.
+fn timestep_table(steps: usize, dim_time: usize, max_period: usize) -> Vec<f32> {
+    let half = dim_time / 2;
+    let mut values = vec![0.0f32; steps * dim_time];
+    for step in 0..steps {
+        let t = (step + 1) as f32 / steps as f32;
+        for k in 0..half {
+            let frequency = (-((max_period as f32).ln()) * k as f32 / half as f32).exp();
+            let angle = t * frequency;
+            values[step * dim_time + k] = angle.cos();
+            values[step * dim_time + half + k] = angle.sin();
+        }
+    }
+    values
 }
 
 fn load_text(

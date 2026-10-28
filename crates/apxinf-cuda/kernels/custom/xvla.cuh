@@ -109,6 +109,56 @@ __global__ void xvla_sigmoid_bf16_kernel(
     output[gid] = __float2bfloat16(1.0f / (1.0f + expf(-x)));
 }
 
+// ── Packed action tokens for the flow head ────────────────────────────────
+//
+// row = [action (dim_action) | proprio (dim_action) | time (dim_time)] with
+// the two gripper columns of both action and proprio blocks zeroed, matching
+// `EE6DActionSpace.preprocess`.
+
+__global__ void xvla_pack_action_tokens_bf16_kernel(
+    const __nv_bfloat16* action, const __nv_bfloat16* proprio,
+    const __nv_bfloat16* time, __nv_bfloat16* output, int rows,
+    int dim_action, int dim_time, int gripper0, int gripper1)
+{
+    const int total = dim_action * 2 + dim_time;
+    int64_t count = (int64_t)rows * total;
+    int64_t gid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= count) return;
+    const int column = (int)(gid % total);
+    const int64_t row = gid / total;
+    const __nv_bfloat16 zero = __float2bfloat16(0.0f);
+    if (column < dim_action) {
+        output[gid] =
+            (column == gripper0 || column == gripper1)
+                ? zero
+                : action[row * dim_action + column];
+    } else if (column < dim_action * 2) {
+        const int index = column - dim_action;
+        output[gid] =
+            (index == gripper0 || index == gripper1) ? zero : proprio[index];
+    } else {
+        output[gid] = time[column - dim_action * 2];
+    }
+}
+
+// ── Sigmoid over two columns (ee6d gripper postprocess) ───────────────────
+
+__global__ void xvla_sigmoid_columns_bf16_kernel(
+    const __nv_bfloat16* input, __nv_bfloat16* output, int rows, int columns,
+    int index0, int index1)
+{
+    int64_t count = (int64_t)rows * columns;
+    int64_t gid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= count) return;
+    const int column = (int)(gid % columns);
+    if (column == index0 || column == index1) {
+        const float value = __bfloat162float(input[gid]);
+        output[gid] = __float2bfloat16(1.0f / (1.0f + expf(-value)));
+    } else {
+        output[gid] = input[gid];
+    }
+}
+
 // ── Unbounded row gather (window partition needs duplicated/zero rows) ────
 
 __global__ void xvla_gather_rows_bf16_kernel(
