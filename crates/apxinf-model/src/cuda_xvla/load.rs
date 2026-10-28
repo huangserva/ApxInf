@@ -11,11 +11,11 @@ use std::path::Path;
 use apxinf_core::{DType, Error, Result, Tensor};
 use half::bf16;
 
-use crate::xvla::backend::kernels::{elementwise, xvla_ops::prepare_row_gather};
-use crate::xvla::backend::{transfers, Context};
-use crate::xvla::config::XvlaConfig;
-use crate::xvla::math::image_position_table;
-use crate::xvla::weights::{
+use crate::cuda_xvla::backend::kernels::{elementwise, xvla_ops::prepare_row_gather};
+use crate::cuda_xvla::backend::{transfers, Context};
+use crate::cuda_xvla::config::XvlaConfig;
+use crate::cuda_xvla::math::image_position_table;
+use crate::cuda_xvla::weights::{
     ActionBlockWeights, ActionHeadWeights, DepthwiseWeights, DomainLinearWeights, LayerNormWeights,
     LinearWeights, StagePlan, TextLayerWeights, TextWeights, VisionBlockWeights,
     VisionStageWeights, VisionWeights, VlmWeights,

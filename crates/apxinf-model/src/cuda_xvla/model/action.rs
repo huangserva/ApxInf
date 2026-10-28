@@ -11,10 +11,10 @@
 
 use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
-use crate::xvla::backend::kernels;
-use crate::xvla::backend::{Context, DeviceBuffer};
-use crate::xvla::config::XvlaConfig;
-use crate::xvla::weights::{ActionBlockWeights, ActionHeadWeights, DomainLinearWeights};
+use crate::cuda_xvla::backend::kernels;
+use crate::cuda_xvla::backend::{Context, DeviceBuffer};
+use crate::cuda_xvla::config::XvlaConfig;
+use crate::cuda_xvla::weights::{ActionBlockWeights, ActionHeadWeights, DomainLinearWeights};
 
 /// Runs the linear flow loop and applies the ee6d gripper sigmoid.
 pub fn generate_actions(
@@ -280,11 +280,11 @@ mod tests {
     use apxinf_core::Tensor;
     use half::bf16;
 
-    use crate::xvla::backend::transfers;
-    use crate::xvla::config::XvlaConfig;
-    use crate::xvla::model::text::encode_vlm;
-    use crate::xvla::model::vision::encode_image;
-    use crate::xvla::weights::{ActionHeadWeights, VlmWeights};
+    use crate::cuda_xvla::backend::transfers;
+    use crate::cuda_xvla::config::XvlaConfig;
+    use crate::cuda_xvla::model::text::encode_vlm;
+    use crate::cuda_xvla::model::vision::encode_image;
+    use crate::cuda_xvla::weights::{ActionHeadWeights, VlmWeights};
 
     use super::{denoise_actions_probed, generate_actions};
 
@@ -308,7 +308,7 @@ mod tests {
             .collect()
     }
 
-    fn upload(ctx: &crate::xvla::backend::Context, values: &[f32], dims: Vec<usize>) -> Tensor {
+    fn upload(ctx: &crate::cuda_xvla::backend::Context, values: &[f32], dims: Vec<usize>) -> Tensor {
         let rounded: Vec<bf16> = values.iter().map(|value| bf16::from_f32(*value)).collect();
         let host = Tensor::from_bf16(dims, &rounded).unwrap();
         transfers::to_cuda(&host, ctx.device_id()).unwrap()
@@ -385,7 +385,7 @@ mod tests {
             )
         });
         let config = XvlaConfig::from_checkpoint(Path::new(&checkpoint)).unwrap();
-        let ctx = crate::xvla::backend::Context::new(0).unwrap();
+        let ctx = crate::cuda_xvla::backend::Context::new(0).unwrap();
         let vlm_weights =
             VlmWeights::from_checkpoint(&config, Path::new(&checkpoint), &ctx).unwrap();
         let action_weights =
@@ -470,7 +470,7 @@ mod tests {
             )
         });
         let config = XvlaConfig::from_checkpoint(Path::new(&checkpoint)).unwrap();
-        let ctx = crate::xvla::backend::Context::new(0).unwrap();
+        let ctx = crate::cuda_xvla::backend::Context::new(0).unwrap();
         let weights =
             ActionHeadWeights::from_checkpoint(&config, Path::new(&checkpoint), &ctx).unwrap();
 

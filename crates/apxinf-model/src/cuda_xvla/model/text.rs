@@ -7,10 +7,10 @@
 
 use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
-use crate::xvla::backend::kernels;
-use crate::xvla::backend::kernels::xvla_ops;
-use crate::xvla::backend::Context;
-use crate::xvla::weights::{TextLayerWeights, VlmWeights};
+use crate::cuda_xvla::backend::kernels;
+use crate::cuda_xvla::backend::kernels::xvla_ops;
+use crate::cuda_xvla::backend::Context;
+use crate::cuda_xvla::weights::{TextLayerWeights, VlmWeights};
 
 type Probe<'a> = &'a mut dyn FnMut(&str, &Tensor) -> Result<()>;
 
@@ -236,8 +236,8 @@ mod tests {
     use apxinf_core::Tensor;
     use half::bf16;
 
-    use crate::xvla::backend::transfers;
-    use crate::xvla::config::XvlaConfig;
+    use crate::cuda_xvla::backend::transfers;
+    use crate::cuda_xvla::config::XvlaConfig;
 
     use super::{encode_vlm, encode_vlm_probed, VlmWeights};
 
@@ -261,7 +261,7 @@ mod tests {
             .collect()
     }
 
-    fn upload(ctx: &crate::xvla::backend::Context, values: &[f32], dims: Vec<usize>) -> Tensor {
+    fn upload(ctx: &crate::cuda_xvla::backend::Context, values: &[f32], dims: Vec<usize>) -> Tensor {
         let rounded: Vec<bf16> = values.iter().map(|value| bf16::from_f32(*value)).collect();
         let host = Tensor::from_bf16(dims, &rounded).unwrap();
         transfers::to_cuda(&host, ctx.device_id()).unwrap()
@@ -271,7 +271,7 @@ mod tests {
         case: &Path,
     ) -> (
         XvlaConfig,
-        crate::xvla::backend::Context,
+        crate::cuda_xvla::backend::Context,
         VlmWeights,
         Vec<Option<Tensor>>,
         Vec<u32>,
@@ -283,7 +283,7 @@ mod tests {
             )
         });
         let config = XvlaConfig::from_checkpoint(Path::new(&checkpoint)).unwrap();
-        let ctx = crate::xvla::backend::Context::new(0).unwrap();
+        let ctx = crate::cuda_xvla::backend::Context::new(0).unwrap();
         let weights = VlmWeights::from_checkpoint(&config, Path::new(&checkpoint), &ctx).unwrap();
 
         let mask = std::fs::read(case.join("view_mask.u8")).unwrap();

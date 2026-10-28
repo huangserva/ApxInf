@@ -7,9 +7,9 @@
 
 use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
-use crate::xvla::backend::{kernels, Context, CublasTranspose, DeviceBuffer};
-use crate::xvla::backend::kernels::xvla_ops;
-use crate::xvla::weights::{
+use crate::cuda_xvla::backend::{kernels, Context, CublasTranspose, DeviceBuffer};
+use crate::cuda_xvla::backend::kernels::xvla_ops;
+use crate::cuda_xvla::weights::{
     DepthwiseWeights, LayerNormWeights, VisionBlockWeights, VisionStageWeights, VisionWeights,
 };
 
@@ -332,8 +332,8 @@ mod tests {
     use apxinf_core::Tensor;
     use half::bf16;
 
-    use crate::xvla::backend::transfers;
-    use crate::xvla::config::XvlaConfig;
+    use crate::cuda_xvla::backend::transfers;
+    use crate::cuda_xvla::config::XvlaConfig;
 
     use super::{encode_image, encode_image_probed, VisionWeights};
 
@@ -347,7 +347,7 @@ mod tests {
             .collect()
     }
 
-    fn setup(case: &Path) -> (XvlaConfig, crate::xvla::backend::Context, VisionWeights, Tensor) {
+    fn setup(case: &Path) -> (XvlaConfig, crate::cuda_xvla::backend::Context, VisionWeights, Tensor) {
         let checkpoint = std::env::var("XVLA_CKPT_DIR").unwrap_or_else(|_| {
             format!(
                 "{}/refs/checkpoints/X-VLA-Libero",
@@ -355,7 +355,7 @@ mod tests {
             )
         });
         let config = XvlaConfig::from_checkpoint(Path::new(&checkpoint)).unwrap();
-        let ctx = crate::xvla::backend::Context::new(0).unwrap();
+        let ctx = crate::cuda_xvla::backend::Context::new(0).unwrap();
         let weights =
             VisionWeights::from_checkpoint(&config, Path::new(&checkpoint), &ctx).unwrap();
 

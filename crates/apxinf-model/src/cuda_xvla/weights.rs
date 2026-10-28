@@ -7,8 +7,8 @@
 
 use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
-use crate::xvla::backend::kernels::xvla_ops::RowGatherPlan;
-use crate::xvla::backend::DeviceBuffer;
+use crate::cuda_xvla::backend::kernels::xvla_ops::RowGatherPlan;
+use crate::cuda_xvla::backend::DeviceBuffer;
 
 #[derive(Debug)]
 pub struct LayerNormWeights {
@@ -206,12 +206,12 @@ pub struct ActionHeadWeights {
 impl ActionHeadWeights {
     /// Load the action head from an X-VLA checkpoint directory or file.
     pub fn from_checkpoint(
-        config: &crate::xvla::config::XvlaConfig,
+        config: &crate::cuda_xvla::config::XvlaConfig,
         path: &std::path::Path,
-        ctx: &crate::xvla::backend::Context,
+        ctx: &crate::cuda_xvla::backend::Context,
     ) -> Result<Self> {
         let (mut tensors, _) =
             apxinf_loader::safetensors::load_native_path(path).map_err(Error::Other)?;
-        crate::xvla::load::load_action(&mut tensors, config, ctx)
+        crate::cuda_xvla::load::load_action(&mut tensors, config, ctx)
     }
 }
