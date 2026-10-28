@@ -86,3 +86,34 @@ pub struct VisionWeights {
     /// `[1, 49]` of ones for the spatial average.
     pub spatial_mean_row: Tensor,
 }
+
+/// One post-norm BART encoder layer.
+#[derive(Debug)]
+pub struct TextLayerWeights {
+    pub q_proj: LinearWeights,
+    pub k_proj: LinearWeights,
+    pub v_proj: LinearWeights,
+    pub out_proj: LinearWeights,
+    pub attn_norm: LayerNormWeights,
+    pub fc1: LinearWeights,
+    pub fc2: LinearWeights,
+    pub ffn_norm: LayerNormWeights,
+}
+
+/// Florence-2 BART text encoder (`vlm.language_model.model.encoder`).
+pub struct TextWeights {
+    /// Tied token embedding `[vocab, d_model]` (`model.shared.weight`).
+    pub embedding: Tensor,
+    /// Pre-gathered absolute positions `[tokens, d_model]` (offset 2).
+    pub positions: Tensor,
+    pub embed_norm: LayerNormWeights,
+    pub layers: Vec<TextLayerWeights>,
+    pub heads: usize,
+    pub head_dim: usize,
+}
+
+/// Everything needed for `forward_vlm` (vision + text encoder).
+pub struct VlmWeights {
+    pub vision: VisionWeights,
+    pub text: TextWeights,
+}

@@ -4,7 +4,6 @@
 //! contract. Adding another accelerator backend changes this seam, not the
 //! layer topology.
 
-pub use crate::accelerator::cuda::kernels::preprocess::ImageLayout;
 pub(crate) use crate::accelerator::cuda::{
-    kernels, transfers, tuning, Context, CublasTranspose, DeviceBuffer, RuntimeBackend,
+    kernels, transfers, Context, CublasTranspose, DeviceBuffer,
 };
