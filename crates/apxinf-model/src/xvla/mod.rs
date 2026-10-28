@@ -27,4 +27,11 @@ pub(crate) mod model;
 
 #[cfg(feature = "cuda")]
 #[allow(dead_code)]
+pub(crate) mod runtime;
+
+#[cfg(feature = "cuda")]
+pub(crate) use runtime::register_builtin;
+
+#[cfg(feature = "cuda")]
+#[allow(dead_code)]
 pub(crate) mod weights;
